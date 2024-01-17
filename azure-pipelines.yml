@@ -1,0 +1,73 @@
+trigger:
+- master
+  
+name: Azure Kubernetes Service - IaC Baseline
+
+variables:
+  azureServiceConnection: 'sp_aks_platform'
+  resourceGroupName: diageo-analytics-nonprod-eun-rg-platform-aks-v2
+  location: 'NorthEurope'
+  templateFile: './main.bicep'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+    - stage: build_stage
+      displayName: "Build"
+      jobs:
+        - job: build_job
+          steps:
+             - task: AzureCLI@2    
+               displayName: "Get ACR Pull Role ID" # Also adds preview flag to AKS Cost preview service. Won't be required once GA.
+               inputs:
+                azureSubscription: $(azureServiceConnection) 
+                addSpnToEnvironment: true  
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                       export ACR_ROLE=$(az role definition list --name 'AcrPull' | jq -r .[].id)
+                       export AKS_RBAC_ROLE=$(az role definition list --name 'Azure Kubernetes Service RBAC Cluster Admin' | jq -r .[].id)
+                       export RUN_CMD_ROLE=$(az role definition list --name 'Azure Kubernetes Service Cluster Admin Role' | jq -r .[].id)
+                       export KV_SEC_ROLE=$(az role definition list --name 'Key Vault Secrets Officer' | jq -r .[].id)
+                       az extension add --name aks-preview
+                       az feature register --namespace "Microsoft.ContainerService" --name "ClusterCostAnalysis"
+                       az feature show --namespace "Microsoft.ContainerService" --name "ClusterCostAnalysis"
+                       export spnObjId=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
+                       export deployRand=$(openssl rand -hex 3)
+                       echo "##vso[task.setvariable variable=deployRand]$deployRand"
+                       echo "##vso[task.setvariable variable=spnObjId]$spnObjId"
+                       echo "##vso[task.setvariable variable=ACR_ROLE]$ACR_ROLE"
+                       echo "##vso[task.setvariable variable=RUN_CMD_ROLE]$RUN_CMD_ROLE"
+                       echo "##vso[task.setvariable variable=AKS_RBAC_ROLE]$AKS_RBAC_ROLE"
+                       echo "##vso[task.setvariable variable=KV_SEC_ROLE]$KV_SEC_ROLE"
+                       
+
+
+             - task: AzureResourceManagerTemplateDeployment@3
+               inputs:
+                deploymentScope: 'Resource Group'
+                addSpnToEnvironment: true
+                azureResourceManagerConnection: '$(azureServiceConnection)'
+                action: 'Create Or Update Resource Group'
+                resourceGroupName: '$(resourceGroupName)'
+                location: '$(location)'
+                templateLocation: 'Linked artifact'
+                csmFile: '$(templateFile)'
+                deploymentMode: 'Incremental'
+                deploymentName: 'AKS-IaC-Baseline'
+                deploymentOutputs: 'bicep_outputs'
+                overrideParameters: '-rgName $(resourceGroupName) -acrRole $(ACR_ROLE) -SPN $(spnObjId) -deployRand $(deployRand) -runcmdRole $(RUN_CMD_ROLE) -aksrbacRole $(AKS_RBAC_ROLE) -kvsecRole $(KV_SEC_ROLE)'
+
+             - task: AzureCLI@2    
+               displayName: "Check pods on cluster"
+               inputs:
+                    azureSubscription: $(azureServiceConnection)   
+                    scriptType: bash
+                    scriptLocation: inlineScript # Add Validation here to check for failures as even when fails pipeline succeeds
+                    inlineScript: | # Add NGINX helm chart to ACR that is created and then deploy on cluster.
+                      az aks command invoke \
+                       --resource-group $(resourceGroupName) \
+                       --name aks-cluster \
+                       --command "kubectl get pods -n kube-system" 
+                       
